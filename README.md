@@ -6,30 +6,157 @@
 
 ---
 
-## Arquitectura
+## Cómo se construyó la plataforma
+
+### Stack tecnológico
+
+| Capa | Tecnología | Por qué |
+|------|-----------|---------|
+| Lenguaje base | **Python 3.10+** | único lenguaje para todo el sistema |
+| Backend / API | **FastAPI 0.110** | async, tipado con Pydantic v2, autodocs en `/docs` |
+| Servidor ASGI | **Uvicorn** | sirve FastAPI en el puerto 8000 |
+| Frontend / UI | **Dash 2.16 + Plotly 5** | genera React automáticamente desde Python, sin JS |
+| Base de datos | **SQLite** (built-in Python) | archivo local `data/skittles.db`, sin servidor |
+| Puerto serial | **PySerial 3.5** | lee UART del Arduino desde un hilo daemon |
+| Validación | **Pydantic v2** | esquemas de request/response en el backend |
+| Comunicación intra-proceso | **requests** | el servidor Dash llama a FastAPI por HTTP local |
+| Estilo | **CSS personalizado** | tema oscuro estilo IoT industrial |
+
+### Protocolos de comunicación
+
+| Enlace | Protocolo | Formato |
+|--------|-----------|---------|
+| Arduino → Backend | **UART / USB Serial** (9 600 baud) | JSON `{"color":"red","confidence":0.94}` o CSV `red,0.94` |
+| Backend → BD | **SQLite** (archivo, sin red) | SQL directo |
+| Backend ↔ Dashboard | **HTTP REST** en `127.0.0.1:8000` | JSON |
+| Dashboard ↔ Navegador | **HTTP + WebSocket** (protocolo interno de Dash) | JSON de callbacks |
+
+---
+
+## Arquitectura de alto nivel
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│   Arduino / Sensor TCS34725                                  │
-│   (o modo simulación — sin hardware requerido)               │
-└───────────────────┬──────────────────────────────────────────┘
-                    │ JSON / CSV por Serial
-                    ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Backend FastAPI  (puerto 8000)                              │
-│  • Lector PySerial (hilo independiente)                      │
-│  • Simulador de dulces (configurable)                        │
-│  • Base de datos SQLite  (data/skittles.db)                  │
-│  • API REST + motor de alertas                               │
-└───────────────────┬──────────────────────────────────────────┘
-                    │ HTTP (requests)
-                    ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Dashboard Dash   (puerto 8050)                              │
-│  • Actualización automática cada 1–5 s                       │
-│  • Gráficas Plotly, distribución de colores, alertas         │
-│  • Panel de control (simulación, serial, exportar, limpiar)  │
-└──────────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        CAPA DE HARDWARE                                     ║
+║                                                                              ║
+║  ┌─────────────────────────────────────────────────────────────────────┐    ║
+║  │  Arduino Uno / Nano                                                  │    ║
+║  │                                                                      │    ║
+║  │   ┌──────────────┐  I²C   ┌─────────────────────────────────────┐  │    ║
+║  │   │  TCS34725    │ ──────▶│  Firmware  arduino_example.ino      │  │    ║
+║  │   │  (sensor     │        │  • Lee valores R/G/B/Clear del sensor│  │    ║
+║  │   │   de color)  │        │  • Clasifica color por umbrales      │  │    ║
+║  │   └──────────────┘        │  • Mueve servo al canal correcto     │  │    ║
+║  │                           │  • Serial.println() → JSON o CSV     │  │    ║
+║  │                           └─────────────────────────────────────┘  │    ║
+║  └──────────────────────────────────┬────────────────────────────────┘    ║
+╚══════════════════════════════════════╪═════════════════════════════════════╝
+                                       │  USB / UART  9 600 baud
+                                       │  JSON: {"color":"red","confidence":0.94,"sensor_id":"TCS34725"}
+                                       │    o   CSV:  red,0.94,TCS34725
+                                       ▼
+╔══════════════════════════════════════════════════════════════════════════════╗
+║               BACKEND  —  Python · FastAPI · Uvicorn  (puerto 8000)         ║
+║                                                                              ║
+║  ┌────────────────────────┐     ┌────────────────────────┐                  ║
+║  │  SerialReader          │     │  Simulator             │                  ║
+║  │  (hilo daemon Python)  │     │  (hilo daemon Python)  │                  ║
+║  │  • pyserial.Serial()   │     │  • genera dulces       │                  ║
+║  │  • parser JSON + CSV   │     │    aleatorios          │                  ║
+║  │  • fuente: "serial"    │     │  • fuente: "simulation"│                  ║
+║  └───────────┬────────────┘     └───────────┬────────────┘                  ║
+║              │  db.add_detection()           │  db.add_detection()           ║
+║              └───────────────┬───────────────┘                               ║
+║                              ▼                                               ║
+║              ┌──────────────────────────────┐                                ║
+║              │  SQLite  —  skittles.db       │                               ║
+║              │  tabla detections             │                               ║
+║              │  tabla system_events          │                               ║
+║              └──────────────┬───────────────┘                                ║
+║                             │  SQL  (singleton thread-safe)                  ║
+║                             ▼                                                ║
+║  ┌────────────────────────────────────────────────────────────────────────┐  ║
+║  │  FastAPI  app  (Uvicorn ASGI)                                          │  ║
+║  │                                                                        │  ║
+║  │  GET  /health · /detections/latest · /detections/recent               │  ║
+║  │  GET  /stats/summary · /stats/rate · /stats/timeseries                │  ║
+║  │  GET  /stats/throughput · /stats/confidence · /alerts · /events       │  ║
+║  │  POST /simulation/start · /simulation/stop · /config/serial           │  ║
+║  │  POST /serial/stop · /detections/add                                  │  ║
+║  │  DELETE /data/clear   ·   GET /data/export (CSV)                      │  ║
+║  │                                                                        │  ║
+║  │  Modelos Pydantic v2 · CORS abierto · docs en /docs                   │  ║
+║  └────────────────────────────────────────────────────────────────────────┘  ║
+╚══════════════════════════════════════╪═════════════════════════════════════╝
+                                       │  HTTP REST / JSON
+                                       │  requests.get / .post / .delete
+                                       │  http://127.0.0.1:8000/<endpoint>
+                                       │  timeout: 3 s
+                                       ▼
+╔══════════════════════════════════════════════════════════════════════════════╗
+║            DASHBOARD  —  Python · Dash · Plotly  (puerto 8050)              ║
+║                                                                              ║
+║  ┌────────────────────────────────────────────────────────────────────────┐  ║
+║  │  layout.py  —  estructura HTML                                         │  ║
+║  │  • Hero card (última detección)   • Barras de distribución por color   │  ║
+║  │  • Panel de estado del sistema    • Tabla de detecciones recientes     │  ║
+║  │  • Panel de control (simulación, serial, exportar, borrar)             │  ║
+║  └────────────────────────────────────────────────────────────────────────┘  ║
+║                                                                              ║
+║  ┌────────────────────────────────────────────────────────────────────────┐  ║
+║  │  callbacks.py  —  lógica reactiva                                      │  ║
+║  │                                                                        │  ║
+║  │  dcc.Interval ──▶  tick 1 s ──▶  update_hero()   → /detections/latest │  ║
+║  │  dcc.Interval ──▶  tick 2 s ──▶  update_status() → /health + /stats/* │  ║
+║  │                                  update_bar()    → /stats/summary      │  ║
+║  │                                  update_table()  → /detections/recent  │  ║
+║  │  dcc.Interval ──▶  tick 5 s ──▶  update_pie()   → /stats/summary      │  ║
+║  │                                  update_alerts() → /alerts             │  ║
+║  │                                  update_confidence()→/stats/confidence │  ║
+║  │  Botones ────────────────────▶  handle_controls()→ POST/DELETE al API  │  ║
+║  └────────────────────────────────────────────────────────────────────────┘  ║
+╚══════════════════════════════════════╪═════════════════════════════════════╝
+                                       │  HTTP + WebSocket
+                                       │  protocolo interno de Dash
+                                       │  (callbacks como JSON sobre WS)
+                                       ▼
+╔══════════════════════════════════════════════════════════════════════════════╗
+║              NAVEGADOR  —  React  (generado por Dash automáticamente)       ║
+║                                                                              ║
+║  • Recibe HTML+JS inicial al abrir http://localhost:8050                    ║
+║  • Los timers (Interval) disparan callbacks por WebSocket al servidor Dash  ║
+║  • Dash ejecuta la función Python, llama al backend FastAPI, y devuelve     ║
+║    JSON con los nuevos valores de los componentes                           ║
+║  • React actualiza solo los nodos del DOM que cambiaron                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
+### Flujo de datos completo (modo serial)
+
+```
+TCS34725 ──I²C──▶ Arduino ──Serial.println()──▶ USB/UART
+    ──pyserial──▶ SerialReader (hilo) ──db.add_detection()──▶ SQLite
+    ──SQL──▶ FastAPI /detections/latest ──HTTP JSON──▶ Dash callbacks.py
+    ──WebSocket──▶ Navegador React ──DOM patch──▶ Hero card actualizado
+```
+
+### Flujo de datos completo (modo simulación)
+
+```
+Simulator (hilo) ──db.add_detection()──▶ SQLite
+    ──SQL──▶ FastAPI endpoints ──HTTP JSON──▶ Dash callbacks.py
+    ──WebSocket──▶ Navegador ──▶ Todos los paneles actualizados
+```
+
+### Cómo arranca el sistema (`run.py`)
+
+```
+run.py
+ ├─ Thread(daemon=True) ──▶ uvicorn.run("backend.main:app", port=8000)
+ │                            └─▶ FastAPI lifespan: inicia Simulator si SIMULATION_MODE=true
+ │                            └─▶ SerialReader en espera de conexión
+ ├─ _wait_for_api()  ←── polling GET /health hasta que el backend responde
+ └─ main thread ──▶ dash_app.run(port=8050)
 ```
 
 ---
