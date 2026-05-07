@@ -2,7 +2,7 @@
 
 > Dashboard en tiempo real para una máquina clasificadora de Skittles impresa en 3D, desarrollada en Python con FastAPI, Dash y SQLite.
 
-**Equipo:** David Farfán · Kamila G · Alicia G · Roy R · Carlos I · Jorge R
+**Equipo:** Kamila G · Alicia G · Roy R · Carlos I · Jorge R
 
 ---
 
